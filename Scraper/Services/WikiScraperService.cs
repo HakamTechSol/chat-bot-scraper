@@ -1,6 +1,7 @@
-﻿//using PuppeteerSharp;
+﻿
+//using PuppeteerSharp;
 //using System.Text.Json;
-//using System.Text.Encodings.Web; // Yeh zaroori hai readable text ke liye
+//using System.Text.Encodings.Web;
 //using WikiScraperMVC.Models;
 //using System.IO;
 //using Microsoft.Extensions.Logging;
@@ -12,7 +13,6 @@
 //    {
 //        public string title { get; set; } = "";
 //        public string content { get; set; } = "";
-//        //public string bodyHtml { get; set; } = "";
 //        public List<string> links { get; set; } = new();
 //    }
 
@@ -30,7 +30,7 @@
 //    public class WikiScraperService
 //    {
 //        private readonly ILogger<WikiScraperService> _logger;
-//        // Global options taake baar baar na likhna paray
+//        private readonly string _filePath = Path.Combine(Directory.GetCurrentDirectory(), "FullWikiData.json");
 //        private readonly JsonSerializerOptions _jsonOptions = new()
 //        {
 //            WriteIndented = true,
@@ -45,32 +45,18 @@
 //        public async IAsyncEnumerable<ScrapingProgressUpdate> ScrapeWithProgressAsync()
 //        {
 //            var channel = Channel.CreateUnbounded<ScrapingProgressUpdate>();
-
 //            _ = Task.Run(async () =>
 //            {
-//                try
-//                {
-//                    await PerformScrapingAsync(channel.Writer);
-//                }
+//                try { await PerformScrapingAsync(channel.Writer); }
 //                catch (Exception ex)
 //                {
 //                    _logger.LogError(ex, "Fatal error in scraping task");
-//                    await channel.Writer.WriteAsync(new ScrapingProgressUpdate
-//                    {
-//                        Status = "error",
-//                        ErrorMessage = ex.Message
-//                    });
+//                    await channel.Writer.WriteAsync(new ScrapingProgressUpdate { Status = "error", ErrorMessage = ex.Message });
 //                }
-//                finally
-//                {
-//                    channel.Writer.Complete();
-//                }
+//                finally { channel.Writer.Complete(); }
 //            });
 
-//            await foreach (var update in channel.Reader.ReadAllAsync())
-//            {
-//                yield return update;
-//            }
+//            await foreach (var update in channel.Reader.ReadAllAsync()) yield return update;
 //        }
 
 //        private async Task PerformScrapingAsync(ChannelWriter<ScrapingProgressUpdate> writer)
@@ -78,12 +64,14 @@
 //            var baseUrl = "https://wiki.soft1.eu";
 //            var urlsToVisit = new Queue<string>();
 //            urlsToVisit.Enqueue(baseUrl);
-//            var visitedUrls = new HashSet<string>();
 
-//            string filePath = Path.Combine(Directory.GetCurrentDirectory(), "FullWikiData.json");
+//            // 1. Purana data load karein
+//            List<WikiPage> allPages = await LoadExistingDataAsync();
 
-//            if (File.Exists(filePath)) File.Delete(filePath);
-//            await File.WriteAllTextAsync(filePath, "[" + Environment.NewLine);
+//            // 2. Visited set ko file ke data se fill karein taake dobara visit na ho
+//            var visitedUrlsInSession = new HashSet<string>(allPages.Select(p => p.Url.TrimEnd('/')));
+
+//            _logger.LogInformation("🚀 Resume Logic: {Count} pages already in file. Finding new ones...", allPages.Count);
 
 //            try
 //            {
@@ -94,140 +82,128 @@
 //                    wsEndpoint = JsonDocument.Parse(response).RootElement.GetProperty("webSocketDebuggerUrl").GetString();
 //                }
 
-//                var browser = await Puppeteer.ConnectAsync(new ConnectOptions { BrowserWSEndpoint = wsEndpoint });
+//                using var browser = await Puppeteer.ConnectAsync(new ConnectOptions { BrowserWSEndpoint = wsEndpoint });
+//                using var page = await browser.NewPageAsync();
+//                await page.SetViewportAsync(new ViewPortOptions { Width = 1920, Height = 1080 });
 
-//                using (var page = await browser.NewPageAsync())
+//                while (urlsToVisit.Count > 0)
 //                {
-//                    await page.SetViewportAsync(new ViewPortOptions { Width = 1920, Height = 1080 });
+//                    var currentUrl = urlsToVisit.Dequeue().Split('#')[0].TrimEnd('/');
 
-//                    while (urlsToVisit.Count > 0)
+//                    // --- SMART SKIP LOGIC ---
+//                    // Agar URL file mein hai, toh usey visit nahi karenge, bas aage barh jayenge
+//                    // Taake aapka 2000 pages ka time bache.
+//                    var existingPage = allPages.FirstOrDefault(p => p.Url.TrimEnd('/') == currentUrl);
+//                    bool alreadyExists = existingPage != null;
+
+//                    await writer.WriteAsync(new ScrapingProgressUpdate
 //                    {
-//                        var currentUrl = urlsToVisit.Dequeue().Split('#')[0].TrimEnd('/');
+//                        Url = currentUrl,
+//                        Status = alreadyExists ? "already_exists_skipping" : "scraping",
+//                        TotalScraped = allPages.Count,
+//                        QueueCount = urlsToVisit.Count
+//                    });
 
-//                        if (visitedUrls.Contains(currentUrl)) continue;
+//                    // Agar naya page hai toh scrape karein, warna bas links extract karne ke liye visit karein (Optional)
+//                    // Filhaal hum fast kaam ke liye sirf naye pages scrape kar rahe hain.
+//                    if (alreadyExists)
+//                    {
+//                        // Hum yahan naye links find karne ke liye visit kar sakte hain, 
+//                        // lekin agar aap sirf "Baqi 2000 ke baad" wala chah rahay hain toh direct continue:
+//                        // continue; 
+//                    }
 
-//                        await writer.WriteAsync(new ScrapingProgressUpdate
+//                    try
+//                    {
+//                        await page.GoToAsync(currentUrl, new NavigationOptions { WaitUntil = new[] { WaitUntilNavigation.Networkidle2 }, Timeout = 60000 });
+//                        await Task.Delay(1000); // 1 sec delay for safety
+
+//                        var result = await page.EvaluateFunctionAsync<ScrapeResult>(@"() => {
+//                            const allLinks = Array.from(document.querySelectorAll('a'))
+//                                .map(a => a.href)
+//                                .filter(href => href && (href.includes('wiki.soft1.eu/space/') || href.includes('wiki.soft1.eu/display/')));
+//                            const main = document.querySelector('#main-content') || document.querySelector('.wiki-content') || document.body;
+//                            const clone = main.cloneNode(true);
+//                            ['script', 'style', 'nav', 'footer', 'header', 'aside'].forEach(t => clone.querySelectorAll(t).forEach(el => el.remove()));
+//                            return {
+//                                title: document.title,
+//                                content: clone.innerText.replace(/\s+/g, ' ').trim(),
+//                                links: Array.from(new Set(allLinks))
+//                            };
+//                        }");
+
+//                        if (!string.IsNullOrEmpty(result.title))
 //                        {
-//                            PageNumber = visitedUrls.Count + 1,
-//                            Url = currentUrl,
-//                            Status = "scraping",
-//                            TotalScraped = visitedUrls.Count,
-//                            QueueCount = urlsToVisit.Count
-//                        });
+//                            var newPageData = new WikiPage { Title = result.title, Url = currentUrl, Content = result.content, ScrapedAt = DateTime.Now };
 
-//                        try
-//                        {
-//                            await page.GoToAsync(currentUrl, new NavigationOptions
+//                            if (alreadyExists)
 //                            {
-//                                WaitUntil = new[] { WaitUntilNavigation.Networkidle0 },
-//                                Timeout = 90000
-//                            });
-
-//                            await page.EvaluateExpressionAsync("window.scrollTo(0, document.body.scrollHeight)");
-//                            await Task.Delay(2000);
-
-//                            var result = await page.EvaluateFunctionAsync<ScrapeResult>(@"() => {
-//                                const allLinks = Array.from(document.querySelectorAll('a'))
-//                                    .map(a => a.href)
-//                                    .filter(href => href && 
-//                                           (href.includes('wiki.soft1.eu/space/') || href.includes('wiki.soft1.eu/display/')) &&
-//                                           !href.includes('logout') && !href.includes('signup'));
-
-//                                // Specific main content area pick kar rahe hain
-//                                const main = document.querySelector('#main-content') || 
-//                                             document.querySelector('#rw_main_id') || 
-//                                             document.querySelector('.wiki-content') || 
-//                                             document.body;
-
-//                                const clone = main.cloneNode(true);
-
-//                                // Mazeed safayi: Faltu tags remove kar diye
-//                                ['script', 'style', 'button', 'nav', 'footer', 'header', 'svg', 'noscript', 'aside'].forEach(t => 
-//                                    clone.querySelectorAll(t).forEach(el => el.remove()));
-
-//                                return {
-//                                    title: document.title,
-//                                    content: clone.innerText.replace(/\s+/g, ' ').trim(),
-//                                    bodyHtml: clone.innerHTML.replace(/\s+/g, ' ').trim(),
-//                                    links: Array.from(new Set(allLinks))
-//                                };
-//                            }");
-
-//                            if (!string.IsNullOrEmpty(result.title))
+//                                // Monday Sync Logic: Agar content change hai toh update karo
+//                                if (existingPage!.Content != newPageData.Content)
+//                                {
+//                                    int idx = allPages.IndexOf(existingPage);
+//                                    allPages[idx] = newPageData;
+//                                    await SaveAllDataAsync(allPages);
+//                                    _logger.LogInformation("🔄 Updated content for: {Url}", currentUrl);
+//                                }
+//                            }
+//                            else
 //                            {
-//                                var wikiPage = new WikiPage
-//                                {
-//                                    Title = result.title,
-//                                    Url = currentUrl,
-//                                    Content = result.content,
-//                                    //BodyHtml = result.bodyHtml,
-//                                    ScrapedAt = DateTime.Now
-//                                };
-
-//                                string comma = visitedUrls.Count > 0 ? "," : "";
-//                                // Yahan _jsonOptions use ho rahi hain readable text ke liye
-//                                string jsonLine = comma + JsonSerializer.Serialize(wikiPage, _jsonOptions) + Environment.NewLine;
-
-//                                await File.AppendAllTextAsync(filePath, jsonLine);
-//                                visitedUrls.Add(currentUrl);
-
-//                                await writer.WriteAsync(new ScrapingProgressUpdate
-//                                {
-//                                    PageNumber = visitedUrls.Count,
-//                                    Url = currentUrl,
-//                                    Title = result.title,
-//                                    Status = "completed",
-//                                    TotalScraped = visitedUrls.Count,
-//                                    QueueCount = urlsToVisit.Count
-//                                });
+//                                // Bilkul naya page mila
+//                                allPages.Add(newPageData);
+//                                await SaveAllDataAsync(allPages);
+//                                _logger.LogInformation("🆕 Added new page: {Url}", currentUrl);
 //                            }
 
+//                            // Naye links queue mein daalein
 //                            foreach (var link in result.links)
 //                            {
 //                                var cleanL = link.Split('?')[0].Split('#')[0].TrimEnd('/');
-//                                if (!visitedUrls.Contains(cleanL) && !urlsToVisit.Contains(cleanL))
+//                                if (!visitedUrlsInSession.Contains(cleanL))
 //                                {
+//                                    visitedUrlsInSession.Add(cleanL);
 //                                    urlsToVisit.Enqueue(cleanL);
 //                                }
 //                            }
 //                        }
-//                        catch (Exception ex)
-//                        {
-//                            _logger.LogWarning("⚠️ Skipping {Url}: {Msg}", currentUrl, ex.Message);
-//                            await writer.WriteAsync(new ScrapingProgressUpdate { Status = "error", ErrorMessage = ex.Message });
-//                        }
 //                    }
+//                    catch (Exception ex) { _logger.LogWarning("⚠️ Skipping {Url}: {Msg}", currentUrl, ex.Message); }
 //                }
-
-//                await File.AppendAllTextAsync(filePath, "]");
-//                await browser.CloseAsync();
-
-//                await writer.WriteAsync(new ScrapingProgressUpdate { Status = "done", TotalScraped = visitedUrls.Count });
+//                await writer.WriteAsync(new ScrapingProgressUpdate { Status = "done", TotalScraped = allPages.Count });
 //            }
-//            catch (Exception ex)
-//            {
-//                _logger.LogError("❌ FATAL ERROR: {Message}", ex.Message);
-//                if (File.Exists(filePath)) await File.AppendAllTextAsync(filePath, "]");
-//                await writer.WriteAsync(new ScrapingProgressUpdate { Status = "error", ErrorMessage = ex.Message });
-//            }
+//            catch (Exception ex) { _logger.LogError("❌ FATAL: {Message}", ex.Message); }
 //        }
 
+//        private async Task<List<WikiPage>> LoadExistingDataAsync()
+//        {
+//            if (!File.Exists(_filePath)) return new List<WikiPage>();
+//            try
+//            {
+//                var json = await File.ReadAllTextAsync(_filePath);
+//                return JsonSerializer.Deserialize<List<WikiPage>>(json) ?? new List<WikiPage>();
+//            }
+//            catch { return new List<WikiPage>(); }
+//        }
 
+//        private async Task SaveAllDataAsync(List<WikiPage> data)
+//        {
+//            try
+//            {
+//                var json = JsonSerializer.Serialize(data, _jsonOptions);
+//                await File.WriteAllTextAsync(_filePath, json);
+//            }
+//            catch (Exception ex) { _logger.LogError("File Save Error: {Msg}", ex.Message); }
+//        }
 
-//        // Hangfire is method ko har Monday ko chalaye ga
 //        public async Task StartScraping()
 //        {
-//            _logger.LogInformation("📢 Hangfire triggered weekly scraping...");
-
-
 //            var dummyChannel = Channel.CreateUnbounded<ScrapingProgressUpdate>();
 //            await PerformScrapingAsync(dummyChannel.Writer);
-
-//            _logger.LogInformation("✅ Weekly scraping completed successfully!");
 //        }
-
 //    }
 //}
+
+
 using PuppeteerSharp;
 using System.Text.Json;
 using System.Text.Encodings.Web;
@@ -294,34 +270,34 @@ namespace WikiScraperMVC.Services
             var urlsToVisit = new Queue<string>();
             urlsToVisit.Enqueue(baseUrl);
 
-            // 1. Purana data load karein
             List<WikiPage> allPages = await LoadExistingDataAsync();
-
-            // 2. Visited set ko file ke data se fill karein taake dobara visit na ho
             var visitedUrlsInSession = new HashSet<string>(allPages.Select(p => p.Url.TrimEnd('/')));
 
-            _logger.LogInformation("🚀 Resume Logic: {Count} pages already in file. Finding new ones...", allPages.Count);
+            _logger.LogInformation("🚀 Live Server Mode: {Count} existing pages found.", allPages.Count);
 
             try
             {
-                string? wsEndpoint;
-                using (var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) })
-                {
-                    var response = await httpClient.GetStringAsync("http://127.0.0.1:9222/json/version");
-                    wsEndpoint = JsonDocument.Parse(response).RootElement.GetProperty("webSocketDebuggerUrl").GetString();
-                }
+                // 1. Browser download logic (Server par Chrome hona lazmi hai)
+                var browserFetcher = new BrowserFetcher();
+                await browserFetcher.DownloadAsync();
 
-                using var browser = await Puppeteer.ConnectAsync(new ConnectOptions { BrowserWSEndpoint = wsEndpoint });
+                // 2. Launch Browser in Headless Mode (No Window)
+                using var browser = await Puppeteer.LaunchAsync(new LaunchOptions
+                {
+                    Headless = true, // Window nahi khulegi background mein chalega
+                    Args = new[] {
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage" // Linux server memory fix
+                    }
+                });
+
                 using var page = await browser.NewPageAsync();
                 await page.SetViewportAsync(new ViewPortOptions { Width = 1920, Height = 1080 });
 
                 while (urlsToVisit.Count > 0)
                 {
                     var currentUrl = urlsToVisit.Dequeue().Split('#')[0].TrimEnd('/');
-
-                    // --- SMART SKIP LOGIC ---
-                    // Agar URL file mein hai, toh usey visit nahi karenge, bas aage barh jayenge
-                    // Taake aapka 2000 pages ka time bache.
                     var existingPage = allPages.FirstOrDefault(p => p.Url.TrimEnd('/') == currentUrl);
                     bool alreadyExists = existingPage != null;
 
@@ -333,19 +309,14 @@ namespace WikiScraperMVC.Services
                         QueueCount = urlsToVisit.Count
                     });
 
-                    // Agar naya page hai toh scrape karein, warna bas links extract karne ke liye visit karein (Optional)
-                    // Filhaal hum fast kaam ke liye sirf naye pages scrape kar rahe hain.
-                    if (alreadyExists)
-                    {
-                        // Hum yahan naye links find karne ke liye visit kar sakte hain, 
-                        // lekin agar aap sirf "Baqi 2000 ke baad" wala chah rahay hain toh direct continue:
-                        // continue; 
-                    }
+                    // Server performance ke liye: Agar page pehle se hai to scrape na karo (Skip)
+                    // Agar Monday update karna hai to ye skip hata sakte hain
+                    if (alreadyExists) continue;
 
                     try
                     {
                         await page.GoToAsync(currentUrl, new NavigationOptions { WaitUntil = new[] { WaitUntilNavigation.Networkidle2 }, Timeout = 60000 });
-                        await Task.Delay(1000); // 1 sec delay for safety
+                        await Task.Delay(1000); // Server throtelling se bachne ke liye
 
                         var result = await page.EvaluateFunctionAsync<ScrapeResult>(@"() => {
                             const allLinks = Array.from(document.querySelectorAll('a'))
@@ -365,26 +336,9 @@ namespace WikiScraperMVC.Services
                         {
                             var newPageData = new WikiPage { Title = result.title, Url = currentUrl, Content = result.content, ScrapedAt = DateTime.Now };
 
-                            if (alreadyExists)
-                            {
-                                // Monday Sync Logic: Agar content change hai toh update karo
-                                if (existingPage!.Content != newPageData.Content)
-                                {
-                                    int idx = allPages.IndexOf(existingPage);
-                                    allPages[idx] = newPageData;
-                                    await SaveAllDataAsync(allPages);
-                                    _logger.LogInformation("🔄 Updated content for: {Url}", currentUrl);
-                                }
-                            }
-                            else
-                            {
-                                // Bilkul naya page mila
-                                allPages.Add(newPageData);
-                                await SaveAllDataAsync(allPages);
-                                _logger.LogInformation("🆕 Added new page: {Url}", currentUrl);
-                            }
+                            allPages.Add(newPageData);
+                            await SaveAllDataAsync(allPages); // Har page ke baad save (Safe mode)
 
-                            // Naye links queue mein daalein
                             foreach (var link in result.links)
                             {
                                 var cleanL = link.Split('?')[0].Split('#')[0].TrimEnd('/');
@@ -396,7 +350,7 @@ namespace WikiScraperMVC.Services
                             }
                         }
                     }
-                    catch (Exception ex) { _logger.LogWarning("⚠️ Skipping {Url}: {Msg}", currentUrl, ex.Message); }
+                    catch (Exception ex) { _logger.LogWarning("⚠️ Error at {Url}: {Msg}", currentUrl, ex.Message); }
                 }
                 await writer.WriteAsync(new ScrapingProgressUpdate { Status = "done", TotalScraped = allPages.Count });
             }
@@ -421,7 +375,7 @@ namespace WikiScraperMVC.Services
                 var json = JsonSerializer.Serialize(data, _jsonOptions);
                 await File.WriteAllTextAsync(_filePath, json);
             }
-            catch (Exception ex) { _logger.LogError("File Save Error: {Msg}", ex.Message); }
+            catch (Exception ex) { _logger.LogError("Save Error: {Msg}", ex.Message); }
         }
 
         public async Task StartScraping()
