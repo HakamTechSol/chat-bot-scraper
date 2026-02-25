@@ -1,37 +1,95 @@
 ﻿using System.Net.Http.Json;
+using System.Text.Json;
 
-public class AIAnalyzerService
+namespace WikiScraperMVC.Services
 {
-    private readonly HttpClient _httpClient;
-
-    public AIAnalyzerService(HttpClient httpClient)
+    public class AIAnalyzerService
     {
-        _httpClient = httpClient;
-    }
+        private readonly HttpClient _httpClient;
+        private readonly ILogger<AIAnalyzerService> _logger;
 
-    public async Task<AIResponse> GetAnswer(string userQuestion) // 👈 return type badal di
-    {
-        try
+        public AIAnalyzerService(HttpClient httpClient, ILogger<AIAnalyzerService> logger)
         {
-            var response = await _httpClient.GetAsync($"http://127.0.0.1:8000/ask?question={Uri.EscapeDataString(userQuestion)}");
+            _httpClient = httpClient;
+            _logger = logger;
+        }
 
-            if (response.IsSuccessStatusCode)
+        /// <summary>
+        /// Sends a question to the Gemini-powered Python AI Engine
+        /// and returns the structured response.
+        /// </summary>
+        public async Task<GeminiResponse> GetAnswer(string userQuestion)
+        {
+            try
             {
-                var result = await response.Content.ReadFromJsonAsync<AIResponse>();
-                return result; // 👈 Pura object return karein
+                var encodedQuestion = Uri.EscapeDataString(userQuestion);
+                var response = await _httpClient.GetAsync(
+                    $"http://127.0.0.1:8000/ask?question={encodedQuestion}"
+                );
+
+                if (response.IsSuccessStatusCode)
+                {
+                    // The AI Brain returns raw JSON as plain text
+                    var rawJson = await response.Content.ReadAsStringAsync();
+
+                    var result = JsonSerializer.Deserialize<GeminiResponse>(
+                        rawJson,
+                        new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+                    );
+
+                    return result ?? new GeminiResponse
+                    {
+                        Answer = "Empty response from AI Engine.",
+                        Status = "error"
+                    };
+                }
+
+                _logger.LogWarning("AI Engine returned status {StatusCode}", response.StatusCode);
+                return new GeminiResponse
+                {
+                    Answer = $"AI Engine returned HTTP {(int)response.StatusCode}.",
+                    Status = "error"
+                };
             }
-            return new AIResponse { answer = "Python API error." };
-        }
-        catch (Exception)
-        {
-            return new AIResponse { answer = "Could not reach AI Engine." };
+            catch (HttpRequestException ex)
+            {
+                _logger.LogError(ex, "Could not reach AI Engine at http://127.0.0.1:8000");
+                return new GeminiResponse
+                {
+                    Answer = "Could not reach AI Engine. Is the Python service running?",
+                    Status = "error"
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error calling AI Engine");
+                return new GeminiResponse
+                {
+                    Answer = "An unexpected error occurred.",
+                    Status = "error"
+                };
+            }
         }
     }
-}
 
-    public class AIResponse
-{
-    public string answer { get; set; }
-    public string url { get; set; }  
-    public double score { get; set; }
+    /// <summary>
+    /// Matches the strict JSON schema returned by the Gemini AI Brain.
+    /// </summary>
+    public class GeminiResponse
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("answer")]
+        public string Answer { get; set; } = "";
+
+        [System.Text.Json.Serialization.JsonPropertyName("source_link")]
+        public string SourceLink { get; set; } = "";
+
+        [System.Text.Json.Serialization.JsonPropertyName("data_timestamp")]
+        public string DataTimestamp { get; set; } = "";
+
+        [System.Text.Json.Serialization.JsonPropertyName("language")]
+        public string Language { get; set; } = "English";
+
+        [System.Text.Json.Serialization.JsonPropertyName("status")]
+        public string Status { get; set; } = "not_found";
+    }
 }
